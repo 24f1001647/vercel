@@ -1,54 +1,57 @@
-# api/index.py
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import List
+from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
-import json
+import numpy as np
+from pathlib import Path
 
 app = FastAPI()
 
-# Request body model
-class MetricsRequest(BaseModel):
-    regions: List[str]
-    threshold_ms: float
+# Enable CORS for all origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 
-# Load telemetry once at startup
-with open("q-vercel-latency.json", "r") as f:
-    telemetry_data = json.load(f)
-df = pd.DataFrame(telemetry_data)
+# Load the dataset once when the app starts
+# The data file should be in the same directory as this script
+DATA_FILE = Path(__file__).parent / "q-vercel-latency.json"
+df = pd.read_json(DATA_FILE)
 
-# Helper to add CORS headers to every response
-def add_cors_headers(response: JSONResponse):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
 
-# Handle preflight OPTIONS requests
-@app.options("/metrics")
-async def preflight():
-    response = JSONResponse(content={})
-    return add_cors_headers(response)
+@app.get("/")
+async def root():
+    return {"message": "Vercel Latency Analytics API is running."}
 
-# Main POST endpoint
-@app.post("/metrics")
-async def metrics(request: MetricsRequest):
-    result = {}
-    for region in request.regions:
+
+@app.post("/api/")
+async def get_latency_stats(request: Request):
+    payload = await request.json()
+    regions_to_process = payload.get("regions", [])
+    threshold = payload.get("threshold_ms", 200)
+
+    results = []
+
+    for region in regions_to_process:
         region_df = df[df["region"] == region]
-        if region_df.empty:
-            continue
-        avg_latency = region_df["latency_ms"].mean()
-        p95_latency = region_df["latency_ms"].quantile(0.95)
-        avg_uptime = region_df["uptime_pct"].mean() / 100
-        breaches = (region_df["latency_ms"] > request.threshold_ms).sum()
-        result[region] = {
-            "avg_latency": round(avg_latency, 2),
-            "p95_latency": round(p95_latency, 2),
-            "avg_uptime": round(avg_uptime, 3),
-            "breaches": int(breaches)
-        }
 
-    response = JSONResponse(content=result)
-    return add_cors_headers(response)
+        if not region_df.empty:
+            avg_latency = round(region_df["latency_ms"].mean(), 2)
+            p95_latency = round(np.percentile(region_df["latency_ms"], 95), 2)
+            avg_uptime = round(region_df["uptime_pct"].mean(), 3)
+            breaches = int(region_df[region_df["latency_ms"] > threshold].shape[0])
+
+            results.append(
+                {
+                    "region": region,
+                    "avg_latency": avg_latency,
+                    "p95_latency": p95_latency,
+                    "avg_uptime": avg_uptime,
+                    "breaches": breaches,
+                }
+            )
+
+    return {"regions": results}
